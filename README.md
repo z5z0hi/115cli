@@ -60,7 +60,7 @@ After [authenticating](#authentication) with `115cli login`, you can use the `11
 # Download with include/exclude patterns
 115cli fetch /path/to/dir/ -o /local/save/dir/ --include "**/*.mkv" --include "**/*.mp4" --exclude "secret/*"
 
-# Upload (support instant upload)
+# Upload (support instant upload; large files are uploaded in parts and resume automatically after interruptions)
 115cli upload /local/file.txt /remote/dir/file.txt
 # Upload with instant upload only
 115cli upload --instant-only /local/file.txt /remote/dir/file.txt

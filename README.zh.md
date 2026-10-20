@@ -60,7 +60,7 @@ pip install 115cli
 # 下载文件黑白名单
 115cli fetch /path/to/dir/ -o /local/save/dir/ --include "**/*.mkv" --include "**/*.mp4" --exclude "secret/*"
 
-# 上传(支持秒传)
+# 上传(支持秒传; 大文件分片上传, 中断后自动续传)
 115cli upload /local/file.txt /remote/dir/file.txt
 # 仅秒传
 115cli upload --instant-only /local/file.txt /remote/dir/file.txt

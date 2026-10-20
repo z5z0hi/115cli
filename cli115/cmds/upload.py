@@ -11,6 +11,7 @@ from tqdm import tqdm
 from cli115.client.models import Progress
 from cli115.cmds.base import BaseCommand, WorkerCommand
 from cli115.cmds.formatter import PairFormatterMixin, format_entry
+from cli115.exceptions import CommandLineError, InstantUploadNotAvailableError
 from cli115.helpers import format_size, parse_size
 from cli115.uploader import UploadEntry, Uploader
 
@@ -88,12 +89,19 @@ class UploadCommand(PairFormatterMixin, WorkerCommand, BaseCommand):
     def execute(self, args: argparse.Namespace) -> None:
         self.uploader = Uploader(self._create_client(), dry_run=args.dry_run)
 
-        with UploadProgress(
-            self.uploader,
-            show_plan=args.plan or args.dry_run,
-            show_progress=not args.silent and not args.dry_run,
-        ):
-            result = self.run_worker(args)
+        try:
+            with UploadProgress(
+                self.uploader,
+                show_plan=args.plan or args.dry_run,
+                show_progress=not args.silent and not args.dry_run,
+            ):
+                result = self.run_worker(args)
+        except InstantUploadNotAvailableError as exc:
+            raise CommandLineError(
+                "instant upload not available for {0}: the file does not exist "
+                "on 115 servers; re-run without --instant-only to upload it "
+                "normally".format(args.local_path)
+            ) from exc
 
         failed_entries = [
             entry for entry in self.uploader.entries if entry.error is not None

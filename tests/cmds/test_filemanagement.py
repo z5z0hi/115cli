@@ -26,7 +26,7 @@ from cli115.cmds.stat import StatCommand
 from cli115.cmds.upload import UploadCommand
 from cli115.cmds.url import UrlCommand
 from cli115.credentials import CredentialManager
-from cli115.exceptions import CommandLineError
+from cli115.exceptions import CommandLineError, InstantUploadNotAvailableError
 from cli115.uploader import UploadEntry
 from tests.helpers import make_lazy, make_parser
 
@@ -743,6 +743,34 @@ class TestUploadCommand:
 
         call_kwargs = mock_upload.call_args.kwargs
         assert call_kwargs["instant_only"] == 100 * 1024 * 1024
+
+    @patch("cli115.cmds.upload.Uploader.upload")
+    @patch.object(UploadCommand, "_create_client")
+    def test_instant_only_unavailable_raises_friendly_error(
+        self, mock_create, mock_upload
+    ):
+        mock_create.return_value = MagicMock()
+        mock_upload.side_effect = InstantUploadNotAvailableError(
+            "instant upload is not available (file not found on server)"
+        )
+
+        parser, cmds = make_parser()
+        args = parser.parse_args(
+            [
+                "upload",
+                "--instant-only",
+                "1GB",
+                "/local/file.txt",
+                "/remote/file.txt",
+            ]
+        )
+        with pytest.raises(CommandLineError) as excinfo:
+            cmds["upload"].execute(args)
+
+        message = str(excinfo.value)
+        assert "/local/file.txt" in message
+        assert "115 servers" in message
+        assert "--instant-only" in message
 
     @patch("cli115.cmds.upload.Uploader.upload")
     @patch.object(UploadCommand, "_create_client")

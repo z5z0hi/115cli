@@ -77,6 +77,8 @@ class TestInstantUpload:
         client.file.stat = MagicMock(side_effect=FileNotFoundError("path not found"))
         # parent directory always resolves to a fake dir ID
         client.file._resolve_dir_id = MagicMock(return_value="1234")
+        # no pending resume state by default
+        client.file._uploader.resume_state = MagicMock(return_value=None)
         client.file._uploader.instant_upload = MagicMock(return_value=None)
         client.file._uploader.simple_upload = MagicMock(
             return_value=self._fake_upload_response("f.bin", "sha1", 0)
@@ -157,6 +159,35 @@ class TestInstantUpload:
         assert status.instant_upload_error is not None
         assert err_msg in str(status.instant_upload_error)
         mock_client.file._uploader.simple_upload.assert_called_once()
+
+    def test_resume_skips_hash_and_instant(self, mock_client):
+        # a pending resume state must skip hashing and the instant-upload
+        # attempt, and resume the recorded OSS session directly
+        state = {
+            "version": 1,
+            "path": "/remote/f.bin",
+            "size": 32 * 1024 * 1024,
+            "mtime_ns": 1,
+            "part_size": 16 * 1024 * 1024,
+            "bucket": "bkt",
+            "object": "obj",
+            "upload_id": "UID",
+            "callback": {"callback": "c", "callback_var": "v"},
+            "parts": [{"PartNumber": 1, "ETag": "e1", "Size": 16 * 1024 * 1024}],
+        }
+        mock_client.file._uploader.resume_state = MagicMock(return_value=state)
+        mock_client.file._uploader.multipart_upload = MagicMock(
+            return_value=self._fake_upload_response("f.bin", "sha1", state["size"])
+        )
+        status = UploadStatus()
+        mock_client.file.upload("/remote/f.bin", io.BytesIO(b""), status=status)
+
+        mock_client.file._uploader.instant_upload.assert_not_called()
+        mock_client.file._uploader.simple_upload.assert_not_called()
+        kwargs = mock_client.file._uploader.multipart_upload.call_args.kwargs
+        assert kwargs["bucket"] == "bkt"
+        assert kwargs["object"] == "obj"
+        assert kwargs["file_size"] == state["size"]
 
     def test_oversized_file_without_multipart_raises(self, mock_client, monkeypatch):
         # Avoid hashing a multi-gigabyte payload; only the reported size matters.

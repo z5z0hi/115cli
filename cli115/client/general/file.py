@@ -261,15 +261,23 @@ class FileClient(BaseFileClient, BaseClient):
         filename = os.path.basename(path)
         dir_id = self._resolve_dir_id(parent_path)
 
-        status.set_message("calculating file hash...")
-        sha1, file_size = sha1_file(file)
-        status.set_message(f"file sha1 calculated: {sha1}, size: {file_size} bytes")
+        # A pending resume state means a previous multipart attempt for this
+        # exact file was interrupted: skip hashing and the instant-upload
+        # attempt, and continue where it stopped.
+        resumable = self._uploader.resume_state(file)
+        if resumable:
+            file_size = resumable["size"]
+            status.set_message("resuming interrupted upload...")
+        else:
+            status.set_message("calculating file hash...")
+            sha1, file_size = sha1_file(file)
+            status.set_message(f"file sha1 calculated: {sha1}, size: {file_size} bytes")
 
         # Only attempt instant upload when the file meets the minimum size.
         # The initupload.php response (status=1) is preserved so a subsequent
         # multipart upload can reuse the bucket/object/callback metadata.
         init_data: dict | None = None
-        if file_size >= MIN_INSTANT_UPLOAD_SIZE:
+        if file_size >= MIN_INSTANT_UPLOAD_SIZE and not resumable:
             status.set_message("attempting instant upload")
             force_instant = instant_only is not None and file_size >= instant_only
             try:
@@ -294,18 +302,35 @@ class FileClient(BaseFileClient, BaseClient):
             file.set_stream(True)
 
         status.is_instant_uploaded = False
-        if file_size > MAX_SIMPLE_UPLOAD_SIZE and init_data is None:
+        if file_size > MAX_SIMPLE_UPLOAD_SIZE and init_data is None and not resumable:
             raise OSError(
                 f"file size {file_size} bytes exceeds the simple upload limit of "
                 f"{MAX_SIMPLE_UPLOAD_SIZE} bytes and multipart upload is unavailable"
             )
         with status.start_upload(file_size) as progress, progress.patch_file(file):
-            if init_data and file_size > MULTIPART_UPLOAD_PART_SIZE:
+
+            def on_resume(skipped: int) -> None:
+                progress.update(skipped)
+                status.set_message(f"resuming upload from byte {skipped}")
+
+            if resumable and file_size > MULTIPART_UPLOAD_PART_SIZE:
+                # the state carries the session of the interrupted upload
+                resp = self._uploader.multipart_upload(
+                    file,
+                    bucket=resumable["bucket"],
+                    object=resumable["object"],
+                    callback=resumable["callback"],
+                    file_size=file_size,
+                    on_resume=on_resume,
+                )
+            elif init_data and file_size > MULTIPART_UPLOAD_PART_SIZE:
                 resp = self._uploader.multipart_upload(
                     file,
                     bucket=init_data["bucket"],
                     object=init_data["object"],
                     callback=init_data["callback"],
+                    file_size=file_size,
+                    on_resume=on_resume,
                 )
             else:
                 resp = self._uploader.simple_upload(file, pid=dir_id, filename=filename)

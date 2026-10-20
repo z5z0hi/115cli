@@ -45,3 +45,9 @@ htmlcov/
 # Environment
 .env
 *.egg-info/
+
+# Local development notes
+DEVLOG.md
+
+# AI assistant workspace
+.zcode/
