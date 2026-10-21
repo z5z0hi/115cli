@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from os import PathLike
 from typing import Sequence
@@ -9,7 +10,10 @@ from pathspec import PathSpec
 
 from cli115.client import Client
 from cli115.client.models import Directory, File, UploadStatus
+from cli115.exceptions import UploadVerificationError
 from cli115.helpers import join_path
+
+logger = logging.getLogger(__name__)
 
 
 class UploadEntry:
@@ -132,13 +136,75 @@ class Uploader:
         self.entries.append(upload_entry)
         self.on_entry_added.send(self, entries=[upload_entry])
 
-        if not self.dry_run:
-            return self._client.file.upload(
-                remote_path,
-                local_path,
+        if self.dry_run:
+            return None
+
+        result = self._upload_entry(upload_entry, instant_only=instant_only)
+        if result is None:
+            result = self._retry_entry(upload_entry, instant_only=instant_only)
+        return result
+
+    def _upload_entry(
+        self,
+        upload_entry: UploadEntry,
+        *,
+        instant_only: int | None = None,
+        dir_id: str | None = None,
+    ) -> File | None:
+        """Upload one entry, recording any failure on ``upload_entry.error``.
+
+        Returns:
+            The uploaded File on success, ``None`` on failure (or when
+            ``dry_run`` is set).
+        """
+        try:
+            result = self._client.file.upload(
+                upload_entry.remote_path,
+                upload_entry.local_path,
                 instant_only=instant_only,
                 status=upload_entry.status,
+                dir_id=dir_id,
             )
+        except Exception as exc:
+            upload_entry.error = exc
+            return None
+        upload_entry.error = None
+        return result
+
+    def _retry_entry(
+        self,
+        upload_entry: UploadEntry,
+        *,
+        instant_only: int | None = None,
+        dir_id: str | None = None,
+    ) -> File | None:
+        """Retry a failed entry once, as a separate upload."""
+        first_error = upload_entry.error
+        upload_entry.error = None
+        upload_entry.status.set_message(f"retrying after error: {first_error}")
+        logger.warning(
+            "retrying upload of %s after error: %s",
+            os.fspath(upload_entry.local_path),
+            first_error,
+        )
+        result = self._upload_entry(
+            upload_entry, instant_only=instant_only, dir_id=dir_id
+        )
+        if (
+            result is None
+            and isinstance(first_error, UploadVerificationError)
+            and isinstance(upload_entry.error, FileExistsError)
+        ):
+            # The first attempt was reported missing right after completion
+            # (server-side visibility delay), but the retry's duplicate
+            # check found the file, so it did land.
+            logger.warning(
+                "upload of %s already exists on retry, treating as success",
+                os.fspath(upload_entry.local_path),
+            )
+            upload_entry.error = None
+            result = self._client.file.stat(upload_entry.remote_path)
+        return result
 
     def _upload_directory(
         self,
@@ -186,21 +252,23 @@ class Uploader:
         # Create destination directory
         dest_dir = self._client.file.create_directory(dest_path, parents=entry is None)
 
-        # Create intermediate directories
+        # Create intermediate directories under the created destination,
+        # passing the parent ID along so same-name directories elsewhere
+        # can never shadow the target (sorted order visits parents first).
+        dir_ids: dict[str, Directory] = {dest_path: dest_dir}
         for d in sorted(dirs):
-            self._client.file.create_directory(d, parents=True)
+            parent_dir = dir_ids[os.path.dirname(d)]
+            dir_ids[d] = self._client.file.create_directory(d, pid=parent_dir.id)
 
-        # Upload files
+        # Upload files; each failed file is retried once on its own.
         for upload_entry in entries:
-            try:
-                self._client.file.upload(
-                    upload_entry.remote_path,
-                    upload_entry.local_path,
-                    instant_only=instant_only,
-                    status=upload_entry.status,
+            result = self._upload_entry(
+                upload_entry, instant_only=instant_only, dir_id=dest_dir.id
+            )
+            if result is None:
+                self._retry_entry(
+                    upload_entry, instant_only=instant_only, dir_id=dest_dir.id
                 )
-            except Exception as exc:
-                upload_entry.error = exc
 
         return dest_dir
 

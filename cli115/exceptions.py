@@ -33,6 +33,17 @@ class InstantUploadNotAvailableError(Exception):
         super().__init__(message)
 
 
+class UploadVerificationError(OSError):
+    """Raised when the server accepts an upload but the file never appears
+    in the account.
+
+    115's upload callback may report success even when it silently fails to
+    create the file entry.  The content itself is on the upload servers at
+    that point, so an immediate retry of the upload typically completes as
+    an instant upload.
+    """
+
+
 class WAFBlockedError(Exception):
     """Raised when requests are blocked by Aliyun WAF.
 

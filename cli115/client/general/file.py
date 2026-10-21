@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from typing import BinaryIO
 
 from cli115.client.base import (
@@ -23,7 +25,10 @@ from cli115.client.models import (
     UploadStatus,
 )
 from cli115.client.utils import parse_item, parse_ts
-from cli115.exceptions import InstantUploadNotAvailableError
+from cli115.exceptions import (
+    InstantUploadNotAvailableError,
+    UploadVerificationError,
+)
 from cli115.helpers import normalize_path, sha1_file, join_path
 from .base import (
     BaseClient,
@@ -31,6 +36,8 @@ from .base import (
     Endpoint,
 )
 from .upload import MULTIPART_UPLOAD_PART_SIZE, UploadClient
+
+logger = logging.getLogger(__name__)
 
 
 class FileClient(BaseFileClient, BaseClient):
@@ -148,18 +155,23 @@ class FileClient(BaseFileClient, BaseClient):
         )
         return items, pagination
 
-    def create_directory(self, path: str, *, parents: bool = False) -> Directory:
+    def create_directory(
+        self, path: str, *, parents: bool = False, pid: str | None = None
+    ) -> Directory:
         path = normalize_path(path)
         dirname = os.path.dirname(path)
         name = os.path.basename(path)
 
-        try:
-            pid = self._resolve_dir_id(dirname)
-        except FileNotFoundError:
-            if not parents:
-                raise
-            parent_dir = self.create_directory(dirname, parents=True)
-            pid = parent_dir.id
+        # An explicit parent ID wins: it avoids resolving ``dirname`` by
+        # path, which is ambiguous when same-name directories exist.
+        if pid is None:
+            try:
+                pid = self._resolve_dir_id(dirname)
+            except FileNotFoundError:
+                if not parents:
+                    raise
+                parent_dir = self.create_directory(dirname, parents=True)
+                pid = parent_dir.id
 
         try:
             resp = self._api.post(
@@ -218,9 +230,13 @@ class FileClient(BaseFileClient, BaseClient):
     ) -> None:
         src_ids = [self._resolve_id(s) for s in srcs]
         dest_id = self._resolve_dir_id(dest_dir)
+        self._move_file_ids(src_ids, dest_id)
+
+    def _move_file_ids(self, file_ids: list[str], dir_id: str) -> None:
+        """Move entries by raw IDs, bypassing path resolution."""
         self._api.post(
             Endpoint.WEBAPI + "/files/move",
-            data={f"fid[{i}]": id_ for i, id_ in enumerate(src_ids)} | {"pid": dest_id},
+            data={f"fid[{i}]": id_ for i, id_ in enumerate(file_ids)} | {"pid": dir_id},
         )
 
     def copy(self, src: str | FileSystemEntry, dest_dir: str | Directory) -> None:
@@ -243,6 +259,7 @@ class FileClient(BaseFileClient, BaseClient):
         *,
         instant_only: int | None = None,
         status: UploadStatus | None = None,
+        dir_id: str | None = None,
     ) -> File:
         if not status:
             status = UploadStatus()
@@ -259,7 +276,11 @@ class FileClient(BaseFileClient, BaseClient):
 
         parent_path = os.path.dirname(path)
         filename = os.path.basename(path)
-        dir_id = self._resolve_dir_id(parent_path)
+        # Callers that already know the destination directory ID (e.g. a
+        # directory just created by the uploader) pass it in; resolving by
+        # path could pick a same-name directory elsewhere in the drive.
+        if dir_id is None:
+            dir_id = self._resolve_dir_id(parent_path)
 
         # A pending resume state means a previous multipart attempt for this
         # exact file was interrupted: skip hashing and the instant-upload
@@ -267,7 +288,24 @@ class FileClient(BaseFileClient, BaseClient):
         resumable = self._uploader.resume_state(file)
         if resumable:
             file_size = resumable["size"]
-            status.set_message("resuming interrupted upload...")
+            saved_path = resumable.get("remote_path")
+            if saved_path and saved_path != path:
+                # Resuming reuses the callback of the original attempt, so
+                # the file is completed into the original target; it is
+                # moved to the requested destination after completion.
+                logger.warning(
+                    "resume state of %s targets %r, not %r; the file will be "
+                    "moved to the requested destination after completion",
+                    filename,
+                    saved_path,
+                    path,
+                )
+                status.set_message(
+                    f"warning: resuming into original target {saved_path}, "
+                    f"will be moved to {path}"
+                )
+            else:
+                status.set_message("resuming interrupted upload...")
         else:
             status.set_message("calculating file hash...")
             sha1, file_size = sha1_file(file)
@@ -322,6 +360,8 @@ class FileClient(BaseFileClient, BaseClient):
                     callback=resumable["callback"],
                     file_size=file_size,
                     on_resume=on_resume,
+                    remote_path=path,
+                    dir_id=dir_id,
                 )
             elif init_data and file_size > MULTIPART_UPLOAD_PART_SIZE:
                 resp = self._uploader.multipart_upload(
@@ -331,15 +371,37 @@ class FileClient(BaseFileClient, BaseClient):
                     callback=init_data["callback"],
                     file_size=file_size,
                     on_resume=on_resume,
+                    remote_path=path,
+                    dir_id=dir_id,
                 )
             else:
                 resp = self._uploader.simple_upload(file, pid=dir_id, filename=filename)
         data = resp["data"]
+        file_id = str(data.get("file_id", ""))
+
+        # Verify the file actually landed in the account: the upload
+        # callback may report success while 115 silently fails to create
+        # the file entry (observed with large multipart uploads).
+        actual = self._verify_landed(file_id, path, status)
+
+        # A resumed upload completes into the directory recorded in its
+        # resume state; relocate it if that is not the requested target.
+        # A missing parent_id (empty) means the API gave no location info;
+        # do not move based on that.
+        if actual is not None and actual.parent_id and actual.parent_id != str(dir_id):
+            logger.warning(
+                "upload of %s landed in directory %s instead of %s, moving it",
+                path,
+                actual.parent_id,
+                dir_id,
+            )
+            status.set_message("moving file to the target directory...")
+            self._move_file_ids([file_id], dir_id)
 
         status.set_message("upload completed")
 
         return File(
-            id=str(data.get("file_id", "")),
+            id=file_id,
             parent_id=str(dir_id),
             name=data.get("file_name", ""),
             path=path,
@@ -349,6 +411,45 @@ class FileClient(BaseFileClient, BaseClient):
             open_time=None,
             sha1=data.get("sha1", ""),
             size=int(data.get("file_size", 0)),
+        )
+
+    def _verify_landed(
+        self,
+        file_id: str,
+        path: str,
+        status: UploadStatus,
+    ) -> FileSystemEntry | None:
+        """Check that an uploaded file really exists in the account.
+
+        The server may acknowledge the upload callback without actually
+        creating the file.  Lookup by file ID is retried a few times to
+        tolerate short propagation delays.
+
+        Returns:
+            The verified entry, or ``None`` when the server response carried
+            no file ID (in that case only a cheap path lookup is possible
+            and its failure is not treated as fatal).
+
+        Raises:
+            UploadVerificationError: If the server reported a file ID but
+                the file cannot be found in the account.
+        """
+        if not file_id:
+            try:
+                return self.stat(path)
+            except FileNotFoundError:
+                return None
+
+        for attempt in range(3):
+            try:
+                return self.id(file_id)
+            except FileNotFoundError:
+                if attempt < 2:
+                    time.sleep(1)
+        raise UploadVerificationError(
+            f"upload of '{path}' was accepted by the server (file_id={file_id}) "
+            "but the file did not appear in the account; its content is on the "
+            "upload servers, retrying the upload should instant-upload it"
         )
 
     def url(self, path: str | File, *, user_agent: str | None = None) -> DownloadUrl:

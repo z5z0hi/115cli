@@ -510,6 +510,42 @@ class TestStatePersistence:
         assert state["part_size"] == PART_SIZE
         assert state["parts"] == [{"PartNumber": 1, "ETag": "e1", "Size": PART_SIZE}]
 
+    def test_state_records_upload_target(self, client, local_file):
+        # the target of the attempt is persisted so a later resume can
+        # detect that the upload destination changed
+        path, content = local_file
+        with open(path, "rb") as file:
+            client._save_upload_state(
+                file,
+                bucket="bucket",
+                object="obj",
+                upload_id="UID",
+                callback={"callback": "cb", "callback_var": "cbv"},
+                parts=[],
+                remote_path="/remote/dir/big.bin",
+                dir_id="42",
+            )
+            state = client._load_upload_state(file, file_size=len(content))
+        assert state is not None
+        assert state["remote_path"] == "/remote/dir/big.bin"
+        assert state["dir_id"] == "42"
+
+    def test_state_without_target_still_loads(self, client, local_file):
+        # states written by older versions carry no target fields
+        path, content = local_file
+        with open(path, "rb") as file:
+            client._save_upload_state(
+                file,
+                bucket="bucket",
+                object="obj",
+                upload_id="UID",
+                callback={"callback": "cb", "callback_var": "cbv"},
+            )
+            state = client._load_upload_state(file, file_size=len(content))
+        assert state is not None
+        assert state["remote_path"] is None
+        assert state["dir_id"] is None
+
     def test_update_saved_parts(self, client, local_file):
         path, content = local_file
         with open(path, "rb") as file:

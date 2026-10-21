@@ -245,6 +245,8 @@ class UploadClient:
         callback: dict,
         file_size: int | None = None,
         on_resume: Callable[[int], None] | None = None,
+        remote_path: str | None = None,
+        dir_id: str | None = None,
     ) -> dict:
         """Upload a file using the OSS multipart protocol.
 
@@ -265,6 +267,11 @@ class UploadClient:
                 validate the resume state.
             on_resume: Optional callback invoked with the number of bytes
                 already on the server when an upload is resumed.
+            remote_path: Destination path of this upload attempt, recorded
+                in the resume state so a later resume can detect that the
+                target changed.
+            dir_id: Destination directory ID of this upload attempt,
+                recorded alongside ``remote_path``.
 
         Returns:
             Parsed JSON response from the OSS complete-upload callback.
@@ -278,7 +285,16 @@ class UploadClient:
         token = self._get_oss_token()
 
         upload_id, parts, start_part = self._start_multipart(
-            file, url, bucket, object, callback, state, token, on_resume
+            file,
+            url,
+            bucket,
+            object,
+            callback,
+            state,
+            token,
+            on_resume,
+            remote_path=remote_path,
+            dir_id=dir_id,
         )
         # A resumed session may no longer exist on the server (e.g. it was
         # cleaned up while the upload was paused); restart once with a fresh
@@ -298,7 +314,16 @@ class UploadClient:
                     "upload session %s no longer exists, starting over", upload_id
                 )
                 upload_id, parts, start_part = self._start_multipart(
-                    file, url, bucket, object, callback, None, token, None
+                    file,
+                    url,
+                    bucket,
+                    object,
+                    callback,
+                    None,
+                    token,
+                    None,
+                    remote_path=remote_path,
+                    dir_id=dir_id,
                 )
 
         self._clear_upload_state(file)
@@ -314,6 +339,9 @@ class UploadClient:
         state: dict | None,
         token: dict,
         on_resume: Callable[[int], None] | None,
+        *,
+        remote_path: str | None = None,
+        dir_id: str | None = None,
     ) -> tuple[str, list[dict], int]:
         """Seek the file to the first unuploaded byte and prepare the session.
 
@@ -368,6 +396,8 @@ class UploadClient:
                 upload_id=upload_id,
                 callback=callback,
                 parts=[],
+                remote_path=remote_path,
+                dir_id=dir_id,
             )
         return upload_id, parts, start_part
 
@@ -574,8 +604,17 @@ class UploadClient:
         upload_id: str,
         callback: dict,
         parts: list[dict] | None = None,
+        remote_path: str | None = None,
+        dir_id: str | None = None,
     ) -> None:
-        """Persist session info so an interrupted upload can be resumed."""
+        """Persist session info so an interrupted upload can be resumed.
+
+        ``remote_path`` and ``dir_id`` record the target of the upload
+        attempt the session belongs to.  A resumed upload always completes
+        into that original target (the saved callback is bound to it), so
+        the caller can detect a target change and relocate the file after
+        completion.
+        """
         path = self._state_path(file)
         if path is None:
             return
@@ -592,6 +631,8 @@ class UploadClient:
                 "upload_id": upload_id,
                 "callback": callback,
                 "parts": parts or [],
+                "remote_path": remote_path,
+                "dir_id": dir_id,
             }
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp_path = f"{path}.{os.getpid()}.tmp"

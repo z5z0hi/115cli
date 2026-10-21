@@ -338,7 +338,9 @@ class FileClient(ABC):
         """
 
     @abstractmethod
-    def create_directory(self, path: str, *, parents: bool = False) -> Directory:
+    def create_directory(
+        self, path: str, *, parents: bool = False, pid: str | None = None
+    ) -> Directory:
         """Create a new directory.
 
         Args:
@@ -347,6 +349,9 @@ class FileClient(ABC):
             parents: If ``True``, create any missing parent directories
                      automatically (like ``mkdir -p``). If ``False`` (default),
                      raise :exc:`FileNotFoundError` when the parent does not exist.
+            pid: Optional ID of the parent directory.  When given, the parent
+                  is not resolved from ``path``, which avoids ambiguity when
+                  same-name directories exist (``parents`` is ignored).
 
         Returns:
             The created Directory.
@@ -496,6 +501,7 @@ class FileClient(ABC):
         *,
         instant_only: int | None = None,
         status: UploadStatus | None = None,
+        dir_id: str | None = None,
     ) -> File:
         """Upload a file.
 
@@ -516,6 +522,9 @@ class FileClient(ABC):
                   if the server does not have a matching copy.  Values below
                   :data:`MIN_INSTANT_UPLOAD_SIZE` are ignored.
             status: Optional initial upload status to set for the file.
+            dir_id: Optional ID of the destination directory.  When given,
+                  the parent directory is not resolved from ``path``, which
+                  avoids ambiguity when same-name directories exist.
 
         Returns:
             The uploaded File entry.
@@ -526,6 +535,8 @@ class FileClient(ABC):
             InstantUploadNotAvailableError: When the file meets the
                 ``instant_only`` threshold and the server does not have a
                 matching copy of the file.
+            UploadVerificationError: When the server accepts the upload but
+                the file does not appear in the account.
         """
         opened = None
         if isinstance(file, (str, PathLike)):
@@ -537,6 +548,7 @@ class FileClient(ABC):
                 file,
                 instant_only=instant_only,
                 status=status,
+                dir_id=dir_id,
             )
         finally:
             if opened is not None:
@@ -550,6 +562,7 @@ class FileClient(ABC):
         *,
         instant_only: int | None = None,
         status: UploadStatus | None = None,
+        dir_id: str | None = None,
     ) -> File:
         """Perform the actual file upload.
 
@@ -561,7 +574,8 @@ class FileClient(ABC):
             path: Full destination path on the remote disk.
             file: A readable binary file-like object.
             instant_only: See :meth:`upload`.
-            progress_callback: See :meth:`upload`.
+            status: See :meth:`upload`.
+            dir_id: See :meth:`upload`.
 
         Returns:
             The uploaded File entry.

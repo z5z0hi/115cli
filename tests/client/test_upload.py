@@ -11,8 +11,8 @@ import cli115.client.general.file as file_module
 import cli115.client.general.upload as upload_module
 from cli115.client import File, general, UploadStatus
 from cli115.client.base import MAX_SIMPLE_UPLOAD_SIZE
-from cli115.exceptions import InstantUploadNotAvailableError
-from tests.client.conftest import create_temp_file, upload_file
+from cli115.exceptions import InstantUploadNotAvailableError, UploadVerificationError
+from tests.client.conftest import create_temp_file, make_file, upload_file
 
 
 class TestUpload:
@@ -77,6 +77,10 @@ class TestInstantUpload:
         client.file.stat = MagicMock(side_effect=FileNotFoundError("path not found"))
         # parent directory always resolves to a fake dir ID
         client.file._resolve_dir_id = MagicMock(return_value="1234")
+        # uploads are verified by ID after completion; return a consistent entry
+        client.file.id = MagicMock(
+            return_value=make_file(id="999", parent_id="1234", path="/remote/f.bin")
+        )
         # no pending resume state by default
         client.file._uploader.resume_state = MagicMock(return_value=None)
         client.file._uploader.instant_upload = MagicMock(return_value=None)
@@ -188,6 +192,79 @@ class TestInstantUpload:
         assert kwargs["bucket"] == "bkt"
         assert kwargs["object"] == "obj"
         assert kwargs["file_size"] == state["size"]
+        # the upload target is recorded so a later resume can detect a
+        # destination change
+        assert kwargs["remote_path"] == "/remote/f.bin"
+        assert kwargs["dir_id"] == "1234"
+
+    def test_resume_into_changed_target_moves_file(self, mock_client, caplog):
+        # the pending state was created for a different destination; the
+        # resumed upload completes into the original target (its callback)
+        # and must then be relocated to the requested one
+        state = {
+            "version": 1,
+            "path": "/remote/f.bin",
+            "size": 32 * 1024 * 1024,
+            "mtime_ns": 1,
+            "part_size": 16 * 1024 * 1024,
+            "bucket": "bkt",
+            "object": "obj",
+            "upload_id": "UID",
+            "callback": {"callback": "c", "callback_var": "v"},
+            "parts": [{"PartNumber": 1, "ETag": "e1", "Size": 16 * 1024 * 1024}],
+            "remote_path": "/old/f.bin",
+            "dir_id": "OLD",
+        }
+        mock_client.file._uploader.resume_state = MagicMock(return_value=state)
+        mock_client.file._uploader.multipart_upload = MagicMock(
+            return_value=self._fake_upload_response("f.bin", "sha1", state["size"])
+        )
+        # the completed file is found under the ORIGINAL target directory
+        mock_client.file.id = MagicMock(
+            return_value=make_file(id="999", parent_id="OLD", path="/old/f.bin")
+        )
+        mock_client.file._move_file_ids = MagicMock()
+
+        with caplog.at_level("WARNING"):
+            result = mock_client.file.upload(
+                "/remote/f.bin", io.BytesIO(b""), status=UploadStatus()
+            )
+
+        assert result.path == "/remote/f.bin"
+        assert result.parent_id == "1234"
+        mock_client.file._move_file_ids.assert_called_once_with(["999"], "1234")
+        assert any(
+            "moved to the requested destination" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_resume_into_same_target_does_not_move(self, mock_client):
+        state = {
+            "version": 1,
+            "path": "/remote/f.bin",
+            "size": 32 * 1024 * 1024,
+            "mtime_ns": 1,
+            "part_size": 16 * 1024 * 1024,
+            "bucket": "bkt",
+            "object": "obj",
+            "upload_id": "UID",
+            "callback": {"callback": "c", "callback_var": "v"},
+            "parts": [],
+            "remote_path": "/remote/f.bin",
+            "dir_id": "1234",
+        }
+        mock_client.file._uploader.resume_state = MagicMock(return_value=state)
+        mock_client.file._uploader.multipart_upload = MagicMock(
+            return_value=self._fake_upload_response("f.bin", "sha1", state["size"])
+        )
+        mock_client.file._move_file_ids = MagicMock()
+
+        result = mock_client.file.upload(
+            "/remote/f.bin", io.BytesIO(b""), status=UploadStatus()
+        )
+
+        assert isinstance(result, File)
+        mock_client.file._move_file_ids.assert_not_called()
 
     def test_oversized_file_without_multipart_raises(self, mock_client, monkeypatch):
         # Avoid hashing a multi-gigabyte payload; only the reported size matters.
@@ -200,6 +277,75 @@ class TestInstantUpload:
 
         mock_client.file._uploader.simple_upload.assert_not_called()
         mock_client.file._uploader.multipart_upload.assert_not_called()
+
+    def test_verification_failure_raises(self, mock_client, monkeypatch):
+        # the server acknowledges the upload but the file never appears in
+        # the account: must raise instead of reporting success
+        monkeypatch.setattr(file_module.time, "sleep", lambda s: None)
+        mock_client.file._uploader.instant_upload = MagicMock(
+            side_effect=InstantUploadNotAvailableError("not available")
+        )
+        mock_client.file.id = MagicMock(side_effect=FileNotFoundError("gone"))
+        mock_client.file._uploader.simple_upload.return_value = self._fake_upload_response(
+            "f.bin", "sha1", len(self._INSTANT_CONTENT)
+        )
+
+        with pytest.raises(UploadVerificationError, match="did not appear"):
+            mock_client.file.upload(
+                "/remote/f.bin", io.BytesIO(self._INSTANT_CONTENT)
+            )
+        assert mock_client.file.id.call_count == 3  # retried before giving up
+
+    def test_verification_tolerates_short_propagation_delay(self, mock_client):
+        # the file shows up by the third lookup: no error
+        mock_client.file._uploader.instant_upload = MagicMock(
+            side_effect=InstantUploadNotAvailableError("not available")
+        )
+        mock_client.file.id = MagicMock(
+            side_effect=[
+                FileNotFoundError("not yet"),
+                FileNotFoundError("still not"),
+                make_file(id="999", parent_id="1234", path="/remote/f.bin"),
+            ]
+        )
+        mock_client.file._uploader.simple_upload.return_value = self._fake_upload_response(
+            "f.bin", "sha1", len(self._INSTANT_CONTENT)
+        )
+
+        result = mock_client.file.upload(
+            "/remote/f.bin", io.BytesIO(self._INSTANT_CONTENT)
+        )
+        assert isinstance(result, File)
+
+    def test_response_without_file_id_skips_id_verification(self, mock_client):
+        response = self._fake_upload_response("f.bin", "sha1", 13)
+        del response["data"]["file_id"]
+        mock_client.file._uploader.simple_upload.return_value = response
+
+        result = mock_client.file.upload("/remote/f.bin", io.BytesIO(b"small content"))
+        assert isinstance(result, File)
+
+    def test_upload_landed_elsewhere_is_moved(self, mock_client):
+        # completed into a different directory than requested (e.g. resumed
+        # with an old callback): must be moved to the target directory
+        mock_client.file._uploader.instant_upload = MagicMock(
+            side_effect=InstantUploadNotAvailableError("not available")
+        )
+        mock_client.file.id = MagicMock(
+            return_value=make_file(id="999", parent_id="OTHER", path="/remote/f.bin")
+        )
+        mock_client.file._move_file_ids = MagicMock()
+        mock_client.file._uploader.simple_upload.return_value = self._fake_upload_response(
+            "f.bin", "sha1", len(self._INSTANT_CONTENT)
+        )
+
+        result = mock_client.file.upload(
+            "/remote/f.bin", io.BytesIO(self._INSTANT_CONTENT)
+        )
+
+        assert result.path == "/remote/f.bin"
+        assert result.parent_id == "1234"
+        mock_client.file._move_file_ids.assert_called_once_with(["999"], "1234")
 
     @staticmethod
     def _fake_upload_response(name: str, sha1: str, size: int) -> dict:

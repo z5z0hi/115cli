@@ -197,12 +197,20 @@ class UploadProgress:
 
         self.ended_at = time.monotonic()
         elapsed = self.ended_at - self.started_at
+        # derive the final counts from the entries, not from the progress
+        # signals: entries that failed and were retried would otherwise be
+        # counted twice (or their instant-upload success missed)
+        entries = self.uploader.entries
+        total_size = max(sum(entry.size for entry in entries), 1)
+        instant_count = sum(
+            1 for entry in entries if entry.status.is_instant_uploaded
+        )
         tqdm.write(
             "Upload finished in {0:.1f}s: {1} total, {2} of {3} files instantly uploaded".format(
                 elapsed,
-                format_size(self.total_size),
-                self.instant_count,
-                self.total_files,
+                format_size(total_size),
+                instant_count,
+                len(entries),
             )
         )
 
@@ -246,7 +254,11 @@ class UploadProgress:
                 self.current_bar.n = new
                 self.current_bar.refresh()
                 if not completed:
-                    self.overall_bar.n = self.completed_bytes + new
+                    # clamp against the total: a retried entry reports bytes
+                    # that were already counted at its first completion
+                    self.overall_bar.n = min(
+                        self.completed_bytes + new, self.overall_bar.total
+                    )
                     self.overall_bar.refresh()
 
             progress.on_change.connect(on_progress, weak=False)

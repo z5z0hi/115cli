@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from cli115.exceptions import UploadVerificationError
 from cli115.uploader import Uploader
 from tests.client.conftest import make_dir, make_file
 
@@ -55,6 +56,40 @@ class TestUploadFile:
         assert client.file.upload.call_count == 1
         call_args = client.file.upload.call_args
         assert call_args.kwargs["instant_only"] == threshold
+
+    def test_upload_file_retried_once_on_failure(self):
+        client = _make_client()
+        client.file.stat.side_effect = FileNotFoundError("not found")
+        client.file.upload.side_effect = [RuntimeError("boom"), make_file()]
+
+        uploader = Uploader(client)
+        result = uploader.upload("/local/file.txt", "/remote/file.txt")
+
+        assert client.file.upload.call_count == 2
+        assert uploader.entries[0].error is None
+        assert result is not None
+
+    def test_retry_after_verification_error_treats_existing_as_success(self):
+        client = _make_client()
+        # 1st stat: pre-upload duplicate check passes;
+        # 2nd stat: the retry's duplicate check finds the file
+        client.file.stat.side_effect = [
+            FileNotFoundError("not found"),
+            make_file(name="file.txt"),
+        ]
+        # 1st attempt completes but the file cannot be verified;
+        # on retry the duplicate check raises FileExistsError
+        client.file.upload.side_effect = [
+            UploadVerificationError("did not appear"),
+            FileExistsError("remote path already exists"),
+        ]
+
+        uploader = Uploader(client)
+        result = uploader.upload("/local/file.txt", "/remote/file.txt")
+
+        assert client.file.upload.call_count == 2
+        assert uploader.entries[0].error is None
+        assert result is not None
 
 
 class TestUploadDirectory:
@@ -119,20 +154,48 @@ class TestUploadDirectory:
         assert uploaded_names == {"a.txt", "b.txt", "c.txt"}
         assert len(uploader.entries) == 3
 
-    def test_upload_dir_continues_and_records_file_errors(self, tmp_path):
+    def test_upload_dir_continues_and_retries_failed_files(self, tmp_path):
         (tmp_path / "a.txt").write_text("a")
         (tmp_path / "b.txt").write_text("b")
 
         client = _make_client()
         client.file.stat.side_effect = FileNotFoundError("not found")
         client.file.create_directory.return_value = make_dir()
-        client.file.upload.side_effect = [RuntimeError("network error"), make_file()]
+        # a.txt fails once and succeeds on its retry; b.txt succeeds directly
+        client.file.upload.side_effect = [
+            RuntimeError("network error"),
+            make_file(),
+            make_file(),
+        ]
 
         uploader = Uploader(client)
         uploader.upload(str(tmp_path), "/remote/dest")
 
-        assert client.file.upload.call_count == 2
+        assert client.file.upload.call_count == 3
         assert len(uploader.entries) == 2
+        failed_entries = [
+            entry for entry in uploader.entries if entry.error is not None
+        ]
+        assert failed_entries == []
+
+    def test_upload_dir_records_permanently_failed_file(self, tmp_path):
+        (tmp_path / "a.txt").write_text("a")
+        (tmp_path / "b.txt").write_text("b")
+
+        client = _make_client()
+        client.file.stat.side_effect = FileNotFoundError("not found")
+        client.file.create_directory.return_value = make_dir()
+        # a.txt fails twice (initial + retry); b.txt succeeds
+        client.file.upload.side_effect = [
+            RuntimeError("network error"),
+            RuntimeError("retry failed"),
+            make_file(),
+        ]
+
+        uploader = Uploader(client)
+        uploader.upload(str(tmp_path), "/remote/dest")
+
+        assert client.file.upload.call_count == 3
         failed_entries = [
             entry for entry in uploader.entries if entry.error is not None
         ]
@@ -140,7 +203,49 @@ class TestUploadDirectory:
 
         failed_entry = failed_entries[0]
         assert failed_entry.remote_path.endswith("/a.txt")
-        assert str(failed_entry.error) == "network error"
+        assert str(failed_entry.error) == "retry failed"
+
+    def test_upload_dir_passes_dest_dir_id_to_uploads(self, tmp_path):
+        (tmp_path / "a.txt").write_text("a")
+
+        client = _make_client()
+        client.file.stat.side_effect = FileNotFoundError("not found")
+        client.file.create_directory.return_value = make_dir(id="100")
+
+        uploader = Uploader(client)
+        uploader.upload(str(tmp_path), "/remote/dest")
+
+        assert client.file.upload.call_count == 1
+        assert client.file.upload.call_args.kwargs["dir_id"] == "100"
+
+    def test_upload_dir_nested_dirs_created_with_parent_id(self, tmp_path):
+        # Structure:
+        #   tmp/
+        #     sub1/
+        #       sub2/
+        #         deep.txt
+        sub1 = tmp_path / "sub1"
+        sub1.mkdir()
+        sub2 = sub1 / "sub2"
+        sub2.mkdir()
+        (sub2 / "deep.txt").write_text("deep")
+
+        client = _make_client()
+        client.file.stat.side_effect = FileNotFoundError("not found")
+        dest_dir = make_dir(id="100")
+        sub1_dir = make_dir(id="201")
+        sub2_dir = make_dir(id="202")
+        client.file.create_directory.side_effect = [dest_dir, sub1_dir, sub2_dir]
+
+        uploader = Uploader(client)
+        uploader.upload(str(tmp_path), "/remote/dest")
+
+        calls = client.file.create_directory.call_args_list
+        assert calls[0].args[0] == "/remote/dest"
+        assert calls[1].args[0] == "/remote/dest/sub1"
+        assert calls[1].kwargs["pid"] == "100"
+        assert calls[2].args[0] == "/remote/dest/sub1/sub2"
+        assert calls[2].kwargs["pid"] == "201"
 
     def test_upload_dir_multilevel_subdirs_created(self, tmp_path):
         # Structure:
